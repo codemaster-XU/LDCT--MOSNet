@@ -1,14 +1,10 @@
-import os
-import time
-import logging
 import numpy as np
 import torch
 from medpy import metric
 from scipy.ndimage import zoom
 import torch.nn as nn
 import SimpleITK as sitk
-from functools import partial
-from multiprocessing import Pool
+from tqdm import tqdm
 
 
 class DiceLoss(nn.Module):
@@ -49,6 +45,7 @@ class DiceLoss(nn.Module):
             loss += dice * weight[i]
         return loss / self.n_classes
 
+
 def calculate_metric_percase(pred, gt):
     pred[pred > 0] = 1
     gt[gt > 0] = 1
@@ -61,20 +58,8 @@ def calculate_metric_percase(pred, gt):
     else:
         return 0, 0
 
-def calculate_metric_list_percase(pred, gt, classes=9):
-    metric_list = []
-    for i in range(1, classes):
-        metric_list.append(calculate_metric_percase(pred == i, gt == i))
-    return np.array(metric_list)
 
-def calculate_metric_multicases(preds, gts, classes=9, num_workers=12):
-    with Pool(num_workers) as p:
-        metrics_list = p.starmap(partial(calculate_metric_list_percase, classes=classes), zip(preds, gts))
-    metrics_list = np.array(metrics_list)
-    metrics_list = metrics_list.mean(axis=0) # 8x2
-    return metrics_list
-
-def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_save_path=None, case=None, z_spacing=1):
+def test_single_volume_Synapse(image, label, net, classes, patch_size=[224, 224], test_save_path=None, case=None, z_spacing=1):
     image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
     if len(image.shape) == 3:
         prediction = np.zeros_like(label)
@@ -86,7 +71,50 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
             input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
             net.eval()
             with torch.no_grad():
-                outputs = net(input)
+                outputs = net(input.repeat(1,3,1,1))
+                out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
+                out = out.cpu().detach().numpy()
+                if x != patch_size[0] or y != patch_size[1]:
+                    pred = zoom(out, (x / patch_size[0], y / patch_size[1]), order=0)
+                else:
+                    pred = out
+                prediction[ind] = pred
+    else:
+        input = torch.from_numpy(image).unsqueeze(
+            0).unsqueeze(0).float().cuda()
+        net.eval()
+        with torch.no_grad():
+            out = torch.argmax(torch.softmax(net(input), dim=1), dim=1).squeeze(0)
+            prediction = out.cpu().detach().numpy()
+    metric_list = []
+    for i in tqdm(range(1, classes), total=classes - 1):
+        metric_list.append(calculate_metric_percase(prediction == i, label == i))
+
+    if test_save_path is not None:
+        img_itk = sitk.GetImageFromArray(image.astype(np.float32))
+        prd_itk = sitk.GetImageFromArray(prediction.astype(np.float32))
+        lab_itk = sitk.GetImageFromArray(label.astype(np.float32))
+        img_itk.SetSpacing((1, 1, z_spacing))
+        prd_itk.SetSpacing((1, 1, z_spacing))
+        lab_itk.SetSpacing((1, 1, z_spacing))
+        sitk.WriteImage(prd_itk, test_save_path + '/'+ case + "_pred.nii.gz")
+        sitk.WriteImage(img_itk, test_save_path + '/'+ case + "_img.nii.gz")
+        sitk.WriteImage(lab_itk, test_save_path + '/'+ case + "_gt.nii.gz")
+    return metric_list
+
+def test_single_volume_AVT(image, label, net, classes, patch_size=[224, 224], test_save_path=None, case=None, origin = None, direction = None, xyz_thickness = None):
+    image, label = image.squeeze(0).cpu().detach().numpy(), label.squeeze(0).cpu().detach().numpy()
+    if len(image.shape) == 3:  #3D
+        prediction = np.zeros_like(label)
+        for ind in tqdm(range(image.shape[0])):
+            slice = image[ind, :, :]
+            x, y = slice.shape[0], slice.shape[1]
+            if x != patch_size[0] or y != patch_size[1]:
+                slice = zoom(slice, (patch_size[0] / x, patch_size[1] / y), order=3)  # previous using 0
+            input = torch.from_numpy(slice).unsqueeze(0).unsqueeze(0).float().cuda()
+            net.eval()
+            with torch.no_grad():
+                outputs = net(input.repeat(1,3,1,1))
                 out = torch.argmax(torch.softmax(outputs, dim=1), dim=1).squeeze(0)
                 out = out.cpu().detach().numpy()
                 if x != patch_size[0] or y != patch_size[1]:
@@ -107,43 +135,20 @@ def test_single_volume(image, label, net, classes, patch_size=[256, 256], test_s
 
     if test_save_path is not None:
         img_itk = sitk.GetImageFromArray(image.astype(np.float32))
+        img_itk.SetOrigin(origin)
+        img_itk.SetDirection(direction)
+        img_itk.SetSpacing((xyz_thickness[0], xyz_thickness[1], xyz_thickness[2]))
+        sitk.WriteImage(img_itk, test_save_path + '/' + case + "_img.nii.gz")
+
         prd_itk = sitk.GetImageFromArray(prediction.astype(np.float32))
+        prd_itk.SetOrigin(origin)
+        prd_itk.SetDirection(direction)
+        prd_itk.SetSpacing((xyz_thickness[0], xyz_thickness[1], xyz_thickness[2]))
+        sitk.WriteImage(prd_itk, test_save_path + '/' + case + "_pred.nii.gz")
+
         lab_itk = sitk.GetImageFromArray(label.astype(np.float32))
-        img_itk.SetSpacing((1, 1, z_spacing))
-        prd_itk.SetSpacing((1, 1, z_spacing))
-        lab_itk.SetSpacing((1, 1, z_spacing))
-        sitk.WriteImage(prd_itk, test_save_path + '/'+case + "_pred.nii.gz")
-        sitk.WriteImage(img_itk, test_save_path + '/'+ case + "_img.nii.gz")
-        sitk.WriteImage(lab_itk, test_save_path + '/'+ case + "_gt.nii.gz")
+        lab_itk.SetOrigin(origin)
+        lab_itk.SetDirection(direction)
+        lab_itk.SetSpacing((xyz_thickness[0], xyz_thickness[1], xyz_thickness[2]))
+        sitk.WriteImage(lab_itk, test_save_path + '/' + case + "_gt.nii.gz")
     return metric_list
-
-def get_logger(filename, verbosity=1, name=None):
-    level_dict = {0: logging.DEBUG, 1: logging.INFO, 2: logging.WARNING}
-    formatter = logging.Formatter(
-        "[%(asctime)s][%(filename)s][line:%(lineno)d][%(levelname)s] %(message)s"
-    )
-    logger = logging.getLogger(name)
-    logger.setLevel(level_dict[verbosity])
-    
-    fh = logging.FileHandler(filename, "w")
-    fh.setFormatter(formatter)
-    logger.addHandler(fh)
-    
-    sh = logging.StreamHandler()
-    sh.setFormatter(formatter)
-    logger.addHandler(sh)
-    
-    return logger
-
-def maybe_mkdir_p(directory: str) -> None:
-    os.makedirs(directory, exist_ok=True)
-
-def make_dirs_by_time(save_dir):
-    version = str(time.time())
-    save_dir = join(save_dir, f"exp_{version}")
-    if not os.path.exists(save_dir):
-        maybe_mkdir_p(save_dir)
-
-    return save_dir
-
-join = os.path.join
